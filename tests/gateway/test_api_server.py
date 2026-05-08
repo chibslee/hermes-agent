@@ -1760,6 +1760,67 @@ class TestResponsesStreaming:
         assert stored is not None, "snapshot must survive client disconnect"
         assert stored["response"]["status"] == "incomplete"
 
+    @pytest.mark.asyncio
+    async def test_stream_responses_emits_reasoning_sse_events(self, adapter):
+        """Responses SSE should forward queued reasoning/thinking deltas.
+
+        This keeps Clear and other Responses clients feeling live even when
+        the assistant is still planning before the first answer token.
+        """
+        fake_request = MagicMock()
+        fake_request.headers = {}
+
+        written_payloads: list[bytes] = []
+
+        class _FakeStreamResponse:
+            async def prepare(self, req):
+                pass
+
+            async def write(self, payload):
+                written_payloads.append(payload)
+
+        import gateway.platforms.api_server as api_mod
+        import queue as _q
+
+        stream_q: _q.Queue = _q.Queue()
+        stream_q.put(("__reasoning_summary__", "Thinking step 1"))
+        stream_q.put(("__reasoning_delta__", "Thinking step 2"))
+        stream_q.put("Final answer")
+        stream_q.put(None)
+
+        async def _agent_coro():
+            return (
+                {"final_response": "Final answer", "messages": [], "api_calls": 0},
+                {"input_tokens": 1, "output_tokens": 2, "total_tokens": 3},
+            )
+
+        agent_task = asyncio.ensure_future(_agent_coro())
+        response_id = f"resp_{uuid.uuid4().hex[:28]}"
+
+        with patch.object(api_mod.web, "StreamResponse", return_value=_FakeStreamResponse()):
+            await adapter._write_sse_responses(
+                request=fake_request,
+                response_id=response_id,
+                model="hermes-agent",
+                created_at=int(time.time()),
+                stream_q=stream_q,
+                agent_task=agent_task,
+                agent_ref=[None],
+                conversation_history=[],
+                user_message="show your work",
+                instructions=None,
+                conversation=None,
+                store=False,
+                session_id=None,
+            )
+
+        body = b"".join(written_payloads).decode()
+        assert "event: response.reasoning_summary_text.delta" in body
+        assert '"delta": "Thinking step 1"' in body
+        assert "event: response.reasoning_text.delta" in body
+        assert '"delta": "Thinking step 2"' in body
+        assert "event: response.output_text.delta" in body
+
 
 # ---------------------------------------------------------------------------
 # Auth on endpoints
@@ -2749,4 +2810,3 @@ class TestSessionKeyHeader:
             assert resp.status == 200
             data = await resp.json()
             assert data["features"]["session_key_header"] == "X-Hermes-Session-Key"
-

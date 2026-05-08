@@ -435,7 +435,10 @@ def _is_kimi_family_endpoint(base_url: str | None, model: str | None = None) -> 
     return False
 
 
-def _is_deepseek_anthropic_endpoint(base_url: str | None) -> bool:
+def _is_deepseek_anthropic_endpoint(
+    base_url: str | None,
+    model: str | None = None,
+) -> bool:
     """Return True for DeepSeek's Anthropic-compatible endpoint.
 
     DeepSeek's ``/anthropic`` route speaks the Anthropic Messages protocol
@@ -452,8 +455,17 @@ def _is_deepseek_anthropic_endpoint(base_url: str | None) -> bool:
     policy used for Kimi's ``/coding`` endpoint.  The match is pinned to
     the ``/anthropic`` path so the OpenAI-compatible ``api.deepseek.com``
     base URL (which never reaches this adapter) is not misclassified.
+
+    Some private gateways proxy DeepSeek's Anthropic-compatible behavior
+    behind non-DeepSeek hostnames. When the active model is a DeepSeek V4
+    family slug, treat the endpoint as DeepSeek-compatible even if the
+    hostname is custom so unsigned thinking blocks survive replay.
     See hermes-agent#16748.
     """
+    normalized_model = str(model or "").strip().lower()
+    if normalized_model.startswith("deepseek-v4"):
+        return True
+
     if not base_url_host_matches(base_url or "", "api.deepseek.com"):
         return False
     normalized = _normalize_base_url_text(base_url)
@@ -1676,8 +1688,9 @@ def convert_messages_to_anthropic(
     # are preserved.  See hermes-agent#13848 (Kimi) and #16748 (DeepSeek).
     _preserve_unsigned_thinking = (
         _is_kimi_family_endpoint(base_url, model)
-        or _is_deepseek_anthropic_endpoint(base_url)
+        or _is_deepseek_anthropic_endpoint(base_url, model)
     )
+    _pad_missing_deepseek_thinking = _is_deepseek_anthropic_endpoint(base_url, model)
 
     last_assistant_idx = None
     for i in range(len(result) - 1, -1, -1):
@@ -1706,6 +1719,19 @@ def convert_messages_to_anthropic(
                 # Unsigned thinking (synthesised from reasoning_content) —
                 # keep it: the upstream needs it for message-history validation.
                 new_content.append(b)
+            if (
+                _pad_missing_deepseek_thinking
+                and not any(
+                    isinstance(b, dict) and b.get("type") == "thinking"
+                    for b in new_content
+                )
+            ):
+                # Sessions created before Hermes preserved streamed DeepSeek
+                # thinking can contain assistant tool-use turns with text/tool
+                # blocks but no replayable thinking block. DeepSeek V4 rejects
+                # those histories in thinking mode, so add a minimal unsigned
+                # placeholder rather than permanently poisoning the session.
+                new_content.insert(0, {"type": "thinking", "thinking": " "})
             m["content"] = new_content or [{"type": "text", "text": "(empty)"}]
         elif _is_third_party or idx != last_assistant_idx:
             # Third-party endpoint: strip ALL thinking blocks from every
@@ -1966,5 +1992,3 @@ def build_anthropic_kwargs(
         kwargs["extra_headers"] = {"anthropic-beta": ",".join(betas)}
 
     return kwargs
-
-

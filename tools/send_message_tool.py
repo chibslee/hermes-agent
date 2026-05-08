@@ -12,12 +12,15 @@ import os
 import re
 import ssl
 import time
+import uuid
 from email.utils import formatdate
 from typing import Dict, Optional
 
 from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
+
+_CLEAR_DEFAULT_INBOX_URL = "http://127.0.0.1:47831/v1/events"
 
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
@@ -623,7 +626,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
 
     last_result = None
     for chunk in chunks:
-        if platform == Platform.SLACK:
+        if platform == Platform.CLEAR:
+            result = await _send_clear(pconfig, chat_id, chunk)
+        elif platform == Platform.SLACK:
             result = await _send_slack(pconfig.token, chat_id, chunk)
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
@@ -665,6 +670,44 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         warnings.append(warning)
         last_result["warnings"] = warnings
     return last_result
+
+
+def _clear_title(message: str) -> str:
+    fallback = "Hermes notice"
+    first = next((line.strip() for line in message.splitlines() if line.strip()), fallback)
+    normalized = re.sub(r"\s+", " ", first).strip() or fallback
+    return normalized if len(normalized) <= 80 else normalized[:77].rstrip() + "..."
+
+
+async def _send_clear(pconfig, chat_id, message):
+    """Deliver a Hermes notice into Clear.app's local AI Tool inbox."""
+    import aiohttp
+
+    extra = getattr(pconfig, "extra", {}) or {}
+    url = str(extra.get("url") or os.getenv("CLEAR_INBOX_URL") or _CLEAR_DEFAULT_INBOX_URL).strip()
+    timeout_seconds = float(extra.get("timeout_seconds") or os.getenv("CLEAR_INBOX_TIMEOUT_SECONDS") or 3)
+    source = str(extra.get("source") or os.getenv("CLEAR_INBOX_SOURCE") or "hermes").strip() or "hermes"
+    target = str(chat_id or "inbox").strip() or "inbox"
+    body = (message or "").strip() or "(empty Hermes message)"
+    event_id = f"hermes-clear:{int(time.time() * 1000)}:{uuid.uuid4()}"
+    payload = {
+        "id": event_id,
+        "source": source,
+        "kind": "completed",
+        "title": _clear_title(body),
+        "body": body,
+    }
+
+    try:
+        timeout = aiohttp.ClientTimeout(total=timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                if response.status < 200 or response.status >= 300:
+                    detail = await response.text()
+                    return _error(f"Clear inbox returned HTTP {response.status}: {detail[:300]}")
+        return {"success": True, "platform": "clear", "chat_id": target, "message_id": event_id}
+    except Exception as exc:
+        return _error(f"Clear inbox delivery failed: {exc}")
 
 
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False):

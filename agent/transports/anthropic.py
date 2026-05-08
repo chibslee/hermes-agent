@@ -30,7 +30,11 @@ class AnthropicTransport(ProviderTransport):
         from agent.anthropic_adapter import convert_messages_to_anthropic
 
         base_url = kwargs.get("base_url")
-        return convert_messages_to_anthropic(messages, base_url=base_url)
+        return convert_messages_to_anthropic(
+            messages,
+            base_url=base_url,
+            model=kwargs.get("model"),
+        )
 
     def convert_tools(self, tools: List[Dict[str, Any]]) -> Any:
         """Convert OpenAI tool schemas to Anthropic input_schema format."""
@@ -94,6 +98,17 @@ class AnthropicTransport(ProviderTransport):
         reasoning_parts = []
         reasoning_details = []
         tool_calls = []
+        streamed_reasoning = (
+            getattr(response, "reasoning_content", None)
+            or getattr(response, "reasoning", None)
+        )
+        if streamed_reasoning is None and hasattr(response, "model_extra"):
+            model_extra = getattr(response, "model_extra", None) or {}
+            if isinstance(model_extra, dict):
+                streamed_reasoning = (
+                    model_extra.get("reasoning_content")
+                    or model_extra.get("reasoning")
+                )
 
         for block in response.content:
             if block.type == "text":
@@ -115,9 +130,14 @@ class AnthropicTransport(ProviderTransport):
                     )
                 )
 
+        if streamed_reasoning and streamed_reasoning not in reasoning_parts:
+            reasoning_parts.append(streamed_reasoning)
+
         finish_reason = self._STOP_REASON_MAP.get(response.stop_reason, "stop")
 
         provider_data = {}
+        if streamed_reasoning:
+            provider_data["reasoning_content"] = streamed_reasoning
         if reasoning_details:
             provider_data["reasoning_details"] = reasoning_details
 

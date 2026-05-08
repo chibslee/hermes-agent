@@ -7153,6 +7153,7 @@ class AIAgent:
             works unchanged.
             """
             has_tool_use = False
+            reasoning_parts: list[str] = []
 
             # Reset stale-stream timer for this attempt
             last_chunk_time["t"] = time.time()
@@ -7195,11 +7196,25 @@ class AIAgent:
                             elif delta_type == "thinking_delta":
                                 thinking_text = getattr(delta, "thinking", "")
                                 if thinking_text:
+                                    reasoning_parts.append(thinking_text)
                                     _fire_first_delta()
                                     self._fire_reasoning_delta(thinking_text)
 
                 # Return the native Anthropic Message for downstream processing
-                return stream.get_final_message()
+                final_message = stream.get_final_message()
+                full_reasoning = "".join(reasoning_parts) or None
+                if full_reasoning:
+                    try:
+                        setattr(final_message, "reasoning_content", full_reasoning)
+                    except Exception:
+                        final_message = SimpleNamespace(
+                            content=getattr(final_message, "content", []),
+                            stop_reason=getattr(final_message, "stop_reason", None),
+                            usage=getattr(final_message, "usage", None),
+                            model=getattr(final_message, "model", None),
+                            reasoning_content=full_reasoning,
+                        )
+                return final_message
 
         def _call():
             import httpx as _httpx

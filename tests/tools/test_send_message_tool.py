@@ -22,8 +22,10 @@ def _reset_signal_scheduler():
 
 from gateway.config import Platform
 from tools.send_message_tool import (
+    _clear_title,
     _derive_forum_thread_name,
     _parse_target_ref,
+    _send_clear,
     _send_discord,
     _send_matrix_via_adapter,
     _send_signal,
@@ -78,6 +80,96 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_clear_title_uses_first_nonempty_line(self):
+        assert _clear_title("\n  Daily digest  \nsecond line") == "Daily digest"
+        assert _clear_title("") == "Hermes notice"
+        assert len(_clear_title("x" * 100)) == 80
+
+    def test_send_clear_posts_clear_inbox_event(self, monkeypatch):
+        captured = {}
+
+        class FakeResponse:
+            status = 201
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self):
+                return ""
+
+        class FakeSession:
+            def __init__(self, timeout):
+                captured["timeout"] = timeout
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                captured["url"] = url
+                captured["payload"] = json
+                return FakeResponse()
+
+        monkeypatch.setattr("aiohttp.ClientSession", FakeSession)
+
+        result = _run_async_immediately(
+            _send_clear(
+                SimpleNamespace(extra={"url": "http://127.0.0.1:47831/v1/events"}),
+                "inbox",
+                "Finished job\nBody line",
+            )
+        )
+
+        assert result["success"] is True
+        assert result["platform"] == "clear"
+        assert result["chat_id"] == "inbox"
+        assert captured["url"] == "http://127.0.0.1:47831/v1/events"
+        assert captured["payload"]["id"].startswith("hermes-clear:")
+        assert captured["payload"]["source"] == "hermes"
+        assert captured["payload"]["kind"] == "completed"
+        assert captured["payload"]["title"] == "Finished job"
+        assert captured["payload"]["body"] == "Finished job\nBody line"
+
+    def test_send_clear_returns_http_error(self, monkeypatch):
+        class FakeResponse:
+            status = 500
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def text(self):
+                return "nope"
+
+        class FakeSession:
+            def __init__(self, timeout):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            def post(self, url, json):
+                return FakeResponse()
+
+        monkeypatch.setattr("aiohttp.ClientSession", FakeSession)
+
+        result = _run_async_immediately(
+            _send_clear(SimpleNamespace(extra={"url": "http://clear.local/events"}), "inbox", "hello")
+        )
+
+        assert "error" in result
+        assert "HTTP 500" in result["error"]
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()

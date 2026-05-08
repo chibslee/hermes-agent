@@ -790,6 +790,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        thinking_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -838,6 +840,8 @@ class APIServerAdapter(BasePlatformAdapter):
             session_id=session_id,
             platform="api_server",
             stream_delta_callback=stream_delta_callback,
+            thinking_callback=thinking_callback,
+            reasoning_callback=reasoning_callback,
             tool_progress_callback=tool_progress_callback,
             tool_start_callback=tool_start_callback,
             tool_complete_callback=tool_complete_callback,
@@ -1077,6 +1081,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
+            def _on_thinking(delta):
+                if delta:
+                    _stream_q.put(("__reasoning_summary__", str(delta)))
+
+            def _on_reasoning(delta):
+                if delta:
+                    _stream_q.put(("__reasoning_delta__", str(delta)))
+
             # Track which tool_call_ids we've emitted a "running" lifecycle
             # event for, so a "completed" event without a matching "running"
             # (e.g. internal/filtered tools) is silently dropped instead of
@@ -1140,6 +1152,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=system_prompt,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                thinking_callback=_on_thinking,
+                reasoning_callback=_on_reasoning,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
                 agent_ref=agent_ref,
@@ -1575,6 +1589,18 @@ class APIServerAdapter(BasePlatformAdapter):
                     "logprobs": [],
                 })
 
+            async def _emit_reasoning_delta(delta_text: str) -> None:
+                await _write_event("response.reasoning_text.delta", {
+                    "type": "response.reasoning_text.delta",
+                    "delta": delta_text,
+                })
+
+            async def _emit_reasoning_summary(delta_text: str) -> None:
+                await _write_event("response.reasoning_summary_text.delta", {
+                    "type": "response.reasoning_summary_text.delta",
+                    "delta": delta_text,
+                })
+
             async def _emit_tool_started(payload: Dict[str, Any]) -> str:
                 """Emit response.output_item.added for a function_call.
 
@@ -1687,20 +1713,26 @@ class APIServerAdapter(BasePlatformAdapter):
 
                 Plain strings are text deltas — they are batched (50ms)
                 to reduce Open WebUI re-render storms.  Tagged tuples
-                with ``__tool_started__`` / ``__tool_completed__``
-                prefixes are tool lifecycle events and flush the buffer
-                before emitting.
+                with ``__tool_started__`` / ``__tool_completed__`` /
+                ``__reasoning_delta__`` / ``__reasoning_summary__``
+                are flushed immediately so clients see planning activity
+                with minimal latency before the final answer arrives.
                 """
                 nonlocal _batch_timer
                 if isinstance(it, tuple) and len(it) == 2 and isinstance(it[0], str):
                     tag, payload = it
-                    # Flush batched text before tool events
+                    # Flush batched text before tool/reasoning events so
+                    # event ordering mirrors agent execution order.
                     if _batch_buf:
                         await _flush_batch()
                     if tag == "__tool_started__":
                         await _emit_tool_started(payload)
                     elif tag == "__tool_completed__":
                         await _emit_tool_completed(payload)
+                    elif tag == "__reasoning_delta__":
+                        await _emit_reasoning_delta(payload)
+                    elif tag == "__reasoning_summary__":
+                        await _emit_reasoning_summary(payload)
                 elif isinstance(it, str):
                     # Batch text deltas — append to buffer, flush on timer
                     _batch_buf.append(it)
@@ -2089,13 +2121,20 @@ class APIServerAdapter(BasePlatformAdapter):
                 if delta is not None:
                     _stream_q.put(delta)
 
-            def _on_tool_progress(event_type, name, preview, args, **kwargs):
-                """Queue non-start tool progress events if needed in future.
+            def _on_thinking(delta):
+                if delta:
+                    _stream_q.put(("__reasoning_summary__", str(delta)))
 
-                The structured Responses stream uses ``tool_start_callback``
-                and ``tool_complete_callback`` for exact call-id correlation,
-                so progress events are currently ignored here.
-                """
+            def _on_reasoning(delta):
+                if delta:
+                    _stream_q.put(("__reasoning_delta__", str(delta)))
+
+            def _on_tool_progress(event_type, name, preview, args, **kwargs):
+                # /v1/responses surfaces true model reasoning via
+                # reasoning_callback -> response.reasoning_text.delta.
+                # Do not mirror generic progress previews as reasoning
+                # summaries: those previews may contain final assistant text
+                # and cause clients to render answers inside the thinking UI.
                 return
 
             def _on_tool_start(tool_call_id, function_name, function_args):
@@ -2122,6 +2161,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=instructions,
                 session_id=session_id,
                 stream_delta_callback=_on_delta,
+                thinking_callback=_on_thinking,
+                reasoning_callback=_on_reasoning,
                 tool_progress_callback=_on_tool_progress,
                 tool_start_callback=_on_tool_start,
                 tool_complete_callback=_on_tool_complete,
@@ -2326,7 +2367,7 @@ class APIServerAdapter(BasePlatformAdapter):
             name = (body.get("name") or "").strip()
             schedule = (body.get("schedule") or "").strip()
             prompt = body.get("prompt", "")
-            deliver = body.get("deliver", "local")
+            deliver = body.get("deliver") or body.get("delivery") or "local"
             skills = body.get("skills")
             repeat = body.get("repeat")
 
@@ -2552,6 +2593,8 @@ class APIServerAdapter(BasePlatformAdapter):
         ephemeral_system_prompt: Optional[str] = None,
         session_id: Optional[str] = None,
         stream_delta_callback=None,
+        thinking_callback=None,
+        reasoning_callback=None,
         tool_progress_callback=None,
         tool_start_callback=None,
         tool_complete_callback=None,
@@ -2576,6 +2619,8 @@ class APIServerAdapter(BasePlatformAdapter):
                 ephemeral_system_prompt=ephemeral_system_prompt,
                 session_id=session_id,
                 stream_delta_callback=stream_delta_callback,
+                thinking_callback=thinking_callback,
+                reasoning_callback=reasoning_callback,
                 tool_progress_callback=tool_progress_callback,
                 tool_start_callback=tool_start_callback,
                 tool_complete_callback=tool_complete_callback,

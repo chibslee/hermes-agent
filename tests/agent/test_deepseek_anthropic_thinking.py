@@ -206,6 +206,81 @@ class TestDeepSeekAnthropicPreservesThinking:
         assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/v1") is False
         assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/anthropic") is True
         assert _is_deepseek_anthropic_endpoint("https://api.deepseek.com/anthropic/v1") is True
+        assert _is_deepseek_anthropic_endpoint("http://10.21.7.101:3210") is False
+        assert _is_deepseek_anthropic_endpoint("http://10.21.7.101:3210", "deepseek-v4-flash") is True
+        assert _is_deepseek_anthropic_endpoint("http://10.21.7.101:3210", "deepseek-v4-pro") is True
+        assert _is_deepseek_anthropic_endpoint("http://10.21.7.101:3210", "deepseek-chat") is False
+
+    def test_model_based_detection_preserves_unsigned_thinking_on_custom_gateway(self) -> None:
+        """Custom Anthropic gateways proxying DeepSeek V4 must preserve unsigned
+        thinking blocks even when the hostname is not api.deepseek.com.
+        """
+        from agent.anthropic_adapter import convert_messages_to_anthropic
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "reasoning_content": "planning the tool call",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "skill_view", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        _system, converted = convert_messages_to_anthropic(
+            messages,
+            base_url="http://10.21.7.101:3210",
+            model="deepseek-v4-flash",
+        )
+
+        assistant_msg = next(m for m in converted if m["role"] == "assistant")
+        thinking_blocks = [
+            b for b in assistant_msg["content"]
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == "planning the tool call"
+
+    def test_model_based_detection_pads_legacy_missing_thinking_on_custom_gateway(self) -> None:
+        """Legacy DeepSeek V4 sessions may have assistant tool-use history that
+        predates Hermes preserving streamed thinking. Pad those turns so the
+        upstream does not reject the session forever.
+        """
+        from agent.anthropic_adapter import convert_messages_to_anthropic
+
+        messages = [
+            {"role": "user", "content": "hi"},
+            {
+                "role": "assistant",
+                "content": "I'll use a tool.",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {"name": "skill_view", "arguments": "{}"},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        ]
+        _system, converted = convert_messages_to_anthropic(
+            messages,
+            base_url="http://10.21.7.101:3210",
+            model="deepseek-v4-flash",
+        )
+
+        assistant_msg = next(m for m in converted if m["role"] == "assistant")
+        thinking_blocks = [
+            b for b in assistant_msg["content"]
+            if isinstance(b, dict) and b.get("type") == "thinking"
+        ]
+        assert len(thinking_blocks) == 1
+        assert thinking_blocks[0]["thinking"] == " "
 
     def test_non_deepseek_third_party_still_strips_all_thinking(self) -> None:
         """MiniMax and other third-party Anthropic endpoints must keep the

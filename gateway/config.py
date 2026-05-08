@@ -101,6 +101,7 @@ class Platform(Enum):
     DINGTALK = "dingtalk"
     API_SERVER = "api_server"
     WEBHOOK = "webhook"
+    CLEAR = "clear"
     FEISHU = "feishu"
     WECOM = "wecom"
     WECOM_CALLBACK = "wecom_callback"
@@ -365,6 +366,7 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
     Platform.SMS: lambda cfg: bool(os.getenv("TWILIO_ACCOUNT_SID")),
     Platform.API_SERVER: lambda cfg: True,
     Platform.WEBHOOK: lambda cfg: True,
+    Platform.CLEAR: lambda cfg: True,
     Platform.FEISHU: lambda cfg: bool(cfg.extra.get("app_id")),
     Platform.WECOM: lambda cfg: bool(cfg.extra.get("bot_id")),
     Platform.WECOM_CALLBACK: lambda cfg: bool(
@@ -1347,6 +1349,25 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
                 pass
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
+
+    # Clear.app local inbox delivery. Clear-managed Hermes enables this by
+    # default so cron/notice results can reach the host app without user secrets.
+    clear_enabled = os.getenv("CLEAR_ENABLED", "").lower() in ("true", "1", "yes")
+    clear_managed = os.getenv("HERMES_CLEAR_MANAGED", "").lower() in ("true", "1", "yes")
+    clear_inbox_url = os.getenv("CLEAR_INBOX_URL", "http://127.0.0.1:47831/v1/events").strip()
+    clear_home = os.getenv("CLEAR_HOME_CHANNEL", "inbox").strip()
+    if clear_enabled or clear_managed:
+        if Platform.CLEAR not in config.platforms:
+            config.platforms[Platform.CLEAR] = PlatformConfig()
+        config.platforms[Platform.CLEAR].enabled = True
+        config.platforms[Platform.CLEAR].extra["url"] = clear_inbox_url
+        config.platforms[Platform.CLEAR].extra["source"] = os.getenv("CLEAR_INBOX_SOURCE", "hermes").strip() or "hermes"
+        if clear_home:
+            config.platforms[Platform.CLEAR].home_channel = HomeChannel(
+                platform=Platform.CLEAR,
+                chat_id=clear_home,
+                name=os.getenv("CLEAR_HOME_CHANNEL_NAME", "Clear Inbox"),
+            )
 
     # DingTalk
     dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID")

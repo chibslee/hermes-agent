@@ -350,6 +350,19 @@ class TestResolveDeliveryTarget:
 
         assert _resolve_delivery_targets({"deliver": []}) == []
 
+    def test_clear_inbox_delivery_resolves(self):
+        """deliver='clear:inbox' resolves to Clear's built-in local inbox platform."""
+        job = {
+            "deliver": "clear:inbox",
+            "origin": None,
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "clear",
+            "chat_id": "inbox",
+            "thread_id": None,
+        }
+
 
 class TestDeliverResultWrapping:
     """Verify that cron deliveries are wrapped with header/footer and no longer mirrored."""
@@ -427,6 +440,47 @@ class TestDeliverResultWrapping:
         assert sent_content == "Clean output only."
         assert "Cronjob Response" not in sent_content
         assert "The agent cannot see" not in sent_content
+
+    def test_clear_delivery_uses_standalone_sender(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.CLEAR: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock:
+            job = {
+                "id": "clear-job",
+                "name": "Clear digest",
+                "deliver": "clear:inbox",
+            }
+            result = _deliver_result(job, "Clear-local output.")
+
+        assert result is None
+        send_mock.assert_called_once()
+        assert send_mock.call_args[0][0] == Platform.CLEAR
+        assert send_mock.call_args[0][2] == "inbox"
+
+    def test_clear_delivery_error_is_returned(self):
+        from gateway.config import Platform
+
+        pconfig = MagicMock()
+        pconfig.enabled = True
+        mock_cfg = MagicMock()
+        mock_cfg.platforms = {Platform.CLEAR: pconfig}
+
+        with patch("gateway.config.load_gateway_config", return_value=mock_cfg), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"error": "HTTP 500"})):
+            job = {
+                "id": "clear-job",
+                "deliver": "clear:inbox",
+            }
+            result = _deliver_result(job, "Output.")
+
+        assert result is not None
+        assert "HTTP 500" in result
 
     def test_delivery_extracts_media_tags_before_send(self):
         """Cron delivery should pass MEDIA attachments separately to the send helper."""
